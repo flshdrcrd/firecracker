@@ -1,0 +1,7 @@
+build/
+sdkconfig
+sdkconfig.old
+.clangd
+.cache/
+.vscode/
+.clang-format

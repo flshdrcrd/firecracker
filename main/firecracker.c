@@ -10,8 +10,8 @@
 #include <stdbool.h>
 
 #define PYRO_PIN 17
-#define LED_PIN 999
-#define BUZZER_PIN 999 //16?
+#define LED_PIN 2
+#define BUZZER_PIN 26
 #define I2C_SDA_PIN 21
 #define I2C_SCL_PIN 22
 
@@ -27,7 +27,6 @@
 #define APOGEE_VELOCITY_THRESHOLD -2.0
 #define CONSECUTIVE_SAMPLES 5
 
-#define ARM_SENSE_PIN 4
 
 typedef enum { IDLE, ASCENT, DESCENT } flight_state_t;
 
@@ -75,11 +74,6 @@ static void pyro_init(void) {
     gpio_set_direction(PYRO_PIN, GPIO_MODE_OUTPUT);
     gpio_set_level(PYRO_PIN, 0);
 
-    //mizu az armmal
-    gpio_reset_pin(ARM_SENSE_PIN);
-    gpio_set_direction(ARM_SENSE_PIN, GPIO_MODE_INPUT);
-    gpio_pullup_en(ARM_SENSE_PIN);
-
     gpio_reset_pin(LED_PIN);
     gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
     gpio_set_level(LED_PIN, 0);
@@ -89,7 +83,7 @@ static void pyro_init(void) {
     gpio_set_level(BUZZER_PIN, 1);
 }
 
-static bool pyro_is_armed(void) {  return gpio_get_level(ARM_SENSE_PIN) == 1;}
+//static bool pyro_is_armed(void) {  return gpio_get_level(ARM_SENSE_PIN) == 1;}
 
 static bool pyro_cooldown_ok(void) {
     int64_t now = esp_timer_get_time();
@@ -97,10 +91,6 @@ static bool pyro_cooldown_ok(void) {
 }
 
 static bool pyro_fire_blocking(int ms) {
-    if (!pyro_is_armed()) {
-        printf("PYRO: SAFE\n");
-        return false;
-    }
     if (!pyro_cooldown_ok()) {
         printf("PYRO: cooldown\n");
         return false;

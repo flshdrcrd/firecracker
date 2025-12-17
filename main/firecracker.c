@@ -7,10 +7,11 @@
 #include "mpu6050.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdbool.h>
 
-#define PYRO_PIN 999
+#define PYRO_PIN 17
 #define LED_PIN 999
-#define BUZZER_PIN 999
+#define BUZZER_PIN 999 //16?
 #define I2C_SDA_PIN 21
 #define I2C_SCL_PIN 22
 
@@ -26,6 +27,8 @@
 #define APOGEE_VELOCITY_THRESHOLD -2.0
 #define CONSECUTIVE_SAMPLES 5
 
+#define ARM_SENSE_PIN 4
+
 typedef enum { IDLE, ASCENT, DESCENT } flight_state_t;
 
 typedef struct {
@@ -38,7 +41,13 @@ typedef struct {
 QueueHandle_t sensor_queue;
 
 float calculate_altitude(float pressure_hPa) {
-    return 8425 * log(SEA_LEVEL_PRESSURE / (pressure_hPa / 25600.0));
+    return 8425 * log(SEA_LEVEL_PRESSURE / pressure_hPa);
+}
+
+static void buzzer_beep(int ms) {
+    gpio_set_level(BUZZER_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(ms));
+    gpio_set_level(BUZZER_PIN, 1);
 }
 
 void i2c_init(i2c_master_bus_handle_t *i2c_bus_handle) {
@@ -58,6 +67,57 @@ void i2c_init(i2c_master_bus_handle_t *i2c_bus_handle) {
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_config, i2c_bus_handle));
 }
 
+static int64_t last_pyro_fire_us = -10000000;
+
+static void pyro_init(void) {
+    //arm az alapból low -> ne süljön
+    gpio_reset_pin(PYRO_PIN);
+    gpio_set_direction(PYRO_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(PYRO_PIN, 0);
+
+    //mizu az armmal
+    gpio_reset_pin(ARM_SENSE_PIN);
+    gpio_set_direction(ARM_SENSE_PIN, GPIO_MODE_INPUT);
+    gpio_pullup_en(ARM_SENSE_PIN);
+
+    gpio_reset_pin(LED_PIN);
+    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_PIN, 0);
+
+    gpio_reset_pin(BUZZER_PIN);
+    gpio_set_direction(BUZZER_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(BUZZER_PIN, 1);
+}
+
+static bool pyro_is_armed(void) {  return gpio_get_level(ARM_SENSE_PIN) == 1;}
+
+static bool pyro_cooldown_ok(void) {
+    int64_t now = esp_timer_get_time();
+    return (now - last_pyro_fire_us) > 5000 * 1000LL;
+}
+
+static bool pyro_fire_blocking(int ms) {
+    if (!pyro_is_armed()) {
+        printf("PYRO: SAFE\n");
+        return false;
+    }
+    if (!pyro_cooldown_ok()) {
+        printf("PYRO: cooldown\n");
+        return false;
+    }
+
+    printf("PYRO: SÜTÉS %d ms\n", ms);
+    gpio_set_level(PYRO_PIN, 1); // mosfet egyet kapott, kinyílik
+    ets_delay_us(ms * 1000);
+    gpio_set_level(PYRO_PIN, 0);// msofet zár
+
+    last_pyro_fire_us = esp_timer_get_time();
+    gpio_set_level(LED_PIN, 1);//leddel jelzés h sütütt/sütne
+    buzzer_beep(150);//csipp
+
+    return true;
+}
+
 void app_main(void) {
     i2c_master_bus_handle_t i2c_bus_handle;
     i2c_init(&i2c_bus_handle);
@@ -70,6 +130,9 @@ void app_main(void) {
 
     i2c_master_dev_handle_t dev_mpu6050;
     mpu6050_init(i2c_bus_handle, &dev_mpu6050);
+
+    pyro_init();
+    buzzer_beep(120);
 
     flight_state_t current_state = IDLE;
     int descent_check_counter = 0;
@@ -132,7 +195,8 @@ void app_main(void) {
                            "%.2f m)\n",
                            esp_timer_get_time(), filtered_velocity,
                            filtered_altitude);
-                    // TODO: Fire Pyro
+                
+                           pyro_fire_blocking(120);
                 }
             } else {
                 descent_check_counter = 0;

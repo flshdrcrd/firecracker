@@ -197,6 +197,9 @@ void app_main(void) {
                            filtered_altitude);
                 
                            pyro_fire_blocking(120);
+                        //gpio_set_level(LED_PIN, 1);
+                        //buzzer_beep(200);
+                        //printf("TEST: Apogee detected, WOULD FIRE PYRO HERE\n");
                 }
             } else {
                 descent_check_counter = 0;

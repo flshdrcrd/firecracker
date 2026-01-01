@@ -8,11 +8,17 @@
 #include <math.h>
 #include <stdio.h>
 
-#define PYRO_PIN 999
-#define LED_PIN 999
-#define BUZZER_PIN 999
-#define I2C_SDA_PIN 21
-#define I2C_SCL_PIN 22
+#define PYRO_PIN 32
+#define LED_PIN 2
+#define BUZZER_PIN 27
+
+#define I2C_SCL_PIN 16
+#define I2C_SDA_PIN 17
+
+#define SPI_MISO_PIN 19
+#define SPI_MOSI_PIN 22
+#define SPI_CLK_PIN 21
+#define SPI_CS_PIN 23
 
 #define SEA_LEVEL_PRESSURE 1013.25
 
@@ -58,18 +64,33 @@ void i2c_init(i2c_master_bus_handle_t *i2c_bus_handle) {
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_config, i2c_bus_handle));
 }
 
+void gpio_output_init(void) {
+    uint64_t pin_mask =
+        (1ULL << PYRO_PIN) | (1ULL << LED_PIN) | (1ULL << BUZZER_PIN);
+
+    gpio_config_t io_conf = {
+        .pin_bit_mask = pin_mask,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+
+    gpio_config(&io_conf);
+
+    gpio_set_level(PYRO_PIN, 0);
+    gpio_set_level(LED_PIN, 0);
+    gpio_set_level(BUZZER_PIN, 0);
+}
+
 void app_main(void) {
+    gpio_output_init();
+
     i2c_master_bus_handle_t i2c_bus_handle;
     i2c_init(&i2c_bus_handle);
 
-    bmp280_handle_t dev_bmp280_primary;
-    bmp280_init(i2c_bus_handle, &dev_bmp280_primary, 0x76);
-
-    bmp280_handle_t dev_bmp280_secondary;
-    bmp280_init(i2c_bus_handle, &dev_bmp280_secondary, 0x77);
-
-    i2c_master_dev_handle_t dev_mpu6050;
-    mpu6050_init(i2c_bus_handle, &dev_mpu6050);
+    bmp280_handle_t dev_bmp280;
+    bmp280_init(i2c_bus_handle, &dev_bmp280, 0x76);
 
     flight_state_t current_state = IDLE;
     int descent_check_counter = 0;
@@ -80,7 +101,7 @@ void app_main(void) {
     printf("%lld us | Starting calibration\n", esp_timer_get_time());
     float sum_alt = 0;
     for (int i = 0; i < 50; i++) {
-        bmp280_read(&dev_bmp280_primary, &measurement.bmp_primary);
+        bmp280_read(&dev_bmp280, &measurement.bmp_primary);
         float press_hPa = measurement.bmp_primary.pressure / 25600.0;
         sum_alt += calculate_altitude(press_hPa);
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -95,9 +116,7 @@ void app_main(void) {
 
     while (1) {
         measurement.timestamp = esp_timer_get_time();
-        bmp280_read(&dev_bmp280_primary, &measurement.bmp_primary);
-        bmp280_read(&dev_bmp280_secondary, &measurement.bmp_secondary);
-        mpu6050_read(dev_mpu6050, &measurement.mpu);
+        bmp280_read(&dev_bmp280, &measurement.bmp_primary);
 
         float temp_c = measurement.bmp_primary.temperature / 100.0;
         float press_hPa = measurement.bmp_primary.pressure / 25600.0;

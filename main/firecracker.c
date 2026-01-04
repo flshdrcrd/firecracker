@@ -1,151 +1,115 @@
-#include "bmp280.h"
-#include "driver/gpio.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h" // IWYU pragma: keep
-#include "freertos/queue.h"
-#include "freertos/task.h"
-#include "mpu6050.h"
-#include <math.h>
+#include "driver/spi_common.h"
+#include "esp_log.h"
+#include "esp_vfs_fat.h"
 #include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/unistd.h>
 
-#define PYRO_PIN 999
-#define LED_PIN 999
-#define BUZZER_PIN 999
-#define I2C_SDA_PIN 21
-#define I2C_SCL_PIN 22
+// --- User Pin Definitions ---
+#define SPI_MISO_PIN 19
+#define SPI_MOSI_PIN 22
+#define SPI_CLK_PIN 21
+#define SPI_CS_PIN 23
 
-#define SEA_LEVEL_PRESSURE 1013.25
+static const char *TAG = "SD_NEW_FILE_TEST";
 
-#define LOOP_DELAY_MS 100
-#define LOOP_DT_SEC (LOOP_DELAY_MS / 1000.0)
-
-#define ALPHA_ALT 0.1
-#define ALPHA_VEL 0.1
-
-#define MIN_ALT_INCREASE 50.0
-#define APOGEE_VELOCITY_THRESHOLD -2.0
-#define CONSECUTIVE_SAMPLES 5
-
-typedef enum { IDLE, ASCENT, DESCENT } flight_state_t;
-
-typedef struct {
-    int64_t timestamp;
-    bmp280_data_t bmp_primary;
-    bmp280_data_t bmp_secondary;
-    mpu6050_data_t mpu;
-} sensor_measurement_t;
-
-QueueHandle_t sensor_queue;
-
-float calculate_altitude(float pressure_hPa) {
-    return 8425 * log(SEA_LEVEL_PRESSURE / (pressure_hPa / 25600.0));
-}
-
-void i2c_init(i2c_master_bus_handle_t *i2c_bus_handle) {
-    gpio_config_t io_conf = {.pin_bit_mask =
-                                 (1ULL << I2C_SCL_PIN) | (1ULL << I2C_SDA_PIN),
-                             .mode = GPIO_MODE_INPUT_OUTPUT_OD,
-                             .pull_up_en = GPIO_PULLUP_ENABLE};
-    gpio_config(&io_conf);
-
-    i2c_master_bus_config_t i2c_bus_config = {.clk_source = I2C_CLK_SRC_DEFAULT,
-                                              .scl_io_num = I2C_SCL_PIN,
-                                              .sda_io_num = I2C_SDA_PIN,
-                                              .glitch_ignore_cnt = 7,
-                                              .flags.enable_internal_pullup =
-                                                  true};
-
-    ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_config, i2c_bus_handle));
-}
+// Mount path for the partition
+#define MOUNT_POINT "/sdcard"
+#define SPI_HOST_ID SPI2_HOST
 
 void app_main(void) {
-    i2c_master_bus_handle_t i2c_bus_handle;
-    i2c_init(&i2c_bus_handle);
+    esp_err_t ret;
 
-    bmp280_handle_t dev_bmp280_primary;
-    bmp280_init(i2c_bus_handle, &dev_bmp280_primary, 0x76);
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = true,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024};
 
-    bmp280_handle_t dev_bmp280_secondary;
-    bmp280_init(i2c_bus_handle, &dev_bmp280_secondary, 0x77);
+    ESP_LOGI(TAG, "Initializing SPI bus...");
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = SPI_MOSI_PIN,
+        .miso_io_num = SPI_MISO_PIN,
+        .sclk_io_num = SPI_CLK_PIN,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
 
-    i2c_master_dev_handle_t dev_mpu6050;
-    mpu6050_init(i2c_bus_handle, &dev_mpu6050);
-
-    flight_state_t current_state = IDLE;
-    int descent_check_counter = 0;
-
-    sensor_queue = xQueueCreate(20, sizeof(sensor_measurement_t));
-    sensor_measurement_t measurement;
-
-    printf("%lld us | Starting calibration\n", esp_timer_get_time());
-    float sum_alt = 0;
-    for (int i = 0; i < 50; i++) {
-        bmp280_read(&dev_bmp280_primary, &measurement.bmp_primary);
-        float press_hPa = measurement.bmp_primary.pressure / 25600.0;
-        sum_alt += calculate_altitude(press_hPa);
-        vTaskDelay(pdMS_TO_TICKS(20));
+    ret = spi_bus_initialize(SPI_HOST_ID, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize bus.");
+        return;
     }
-    float ground_altitude = sum_alt / 50.0;
-    float filtered_altitude = ground_altitude;
-    float prev_filtered_altitude = ground_altitude;
-    float filtered_velocity = 0.0;
 
-    printf("%lld us | Ground Altitude set at: %.2f meters\n",
-           esp_timer_get_time(), ground_altitude);
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = SPI_HOST_ID;
 
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = SPI_CS_PIN;
+    slot_config.host_id = host.slot;
+
+    sdmmc_card_t *card;
+    ESP_LOGI(TAG, "Mounting filesystem");
+    ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_config,
+                                  &mount_config, &card);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to mount filesystem.");
+        return;
+    }
+    ESP_LOGI(TAG, "Filesystem mounted");
+
+    char file_path[64];
+    struct stat st;
+    int file_index = 0;
+
+    // Loop until we find a name that doesn't exist
     while (1) {
-        measurement.timestamp = esp_timer_get_time();
-        bmp280_read(&dev_bmp280_primary, &measurement.bmp_primary);
-        bmp280_read(&dev_bmp280_secondary, &measurement.bmp_secondary);
-        mpu6050_read(dev_mpu6050, &measurement.mpu);
+        sprintf(file_path, "%s/data_%d.txt", MOUNT_POINT, file_index);
 
-        float temp_c = measurement.bmp_primary.temperature / 100.0;
-        float press_hPa = measurement.bmp_primary.pressure / 25600.0;
-        float raw_altitude = calculate_altitude(press_hPa);
-
-        filtered_altitude = (ALPHA_ALT * raw_altitude) +
-                            ((1.0 - ALPHA_ALT) * filtered_altitude);
-
-        float instant_velocity =
-            (filtered_altitude - prev_filtered_altitude) / LOOP_DT_SEC;
-
-        filtered_velocity = (ALPHA_VEL * instant_velocity) +
-                            ((1.0 - ALPHA_VEL) * filtered_velocity);
-
-        prev_filtered_altitude = filtered_altitude;
-
-        switch (current_state) {
-        case IDLE:
-            if (filtered_altitude > (ground_altitude + MIN_ALT_INCREASE)) {
-                current_state = ASCENT;
-                printf("%lld us | Launch detected\n", esp_timer_get_time());
-            }
-            break;
-
-        case ASCENT:
-            if (filtered_velocity < APOGEE_VELOCITY_THRESHOLD) {
-                descent_check_counter++;
-
-                if (descent_check_counter >= CONSECUTIVE_SAMPLES) {
-                    current_state = DESCENT;
-                    printf("%lld us | Apogee detected (Vel: %.2f m/s, Alt: "
-                           "%.2f m)\n",
-                           esp_timer_get_time(), filtered_velocity,
-                           filtered_altitude);
-                    // TODO: Fire Pyro
-                }
-            } else {
-                descent_check_counter = 0;
-            }
-            break;
-
-        case DESCENT:
+        // stat returns 0 if file exists, -1 if it doesn't
+        if (stat(file_path, &st) == 0) {
+            // File exists, try the next index
+            ESP_LOGI(TAG, "File %s exists, trying next index...", file_path);
+            file_index++;
+        } else {
+            // File does not exist, we can use this name
             break;
         }
-
-        printf("%lld us | Raw temp: %5.2f C | Raw press: %5.2f hPa\n",
-               esp_timer_get_time(), temp_c, press_hPa);
-
-        vTaskDelay(pdMS_TO_TICKS(LOOP_DELAY_MS));
     }
+
+    ESP_LOGI(TAG, "Writing to new file: %s", file_path);
+
+    FILE *f = fopen(file_path, "w");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open file for writing");
+        return;
+    }
+
+    // Write dynamic content
+    fprintf(f, "Run #%d: Hello ESP-IDF!\n", file_index);
+    fclose(f);
+    ESP_LOGI(TAG, "File written successfully");
+
+    f = fopen(file_path, "r");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open file for reading");
+        return;
+    }
+
+    char line[128];
+    fgets(line, sizeof(line), f);
+    fclose(f);
+
+    // Strip newline for clean logging
+    char *pos = strchr(line, '\n');
+    if (pos)
+        *pos = '\0';
+
+    ESP_LOGI(TAG, "Read back content: '%s'", line);
+
+    esp_vfs_fat_sdcard_unmount(MOUNT_POINT, card);
+    spi_bus_free(SPI_HOST_ID);
+    ESP_LOGI(TAG, "Card unmounted");
 }

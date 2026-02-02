@@ -1,13 +1,17 @@
 #include "bmp280.h"
 #include "driver/gpio.h"
+#include "driver/spi_common.h"
+#include "esp_log.h"
 #include "esp_timer.h"
-#include "freertos/FreeRTOS.h" // IWYU pragma: keep
+#include "esp_vfs_fat.h"
+#include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include <math.h>
 #include <stdio.h>
-
-// Config
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/unistd.h>
 
 // Loop frequency
 #define LOOP_FREQ_HZ 20
@@ -17,31 +21,38 @@
 #define ALPHA_VEL 0.3
 
 // Thresholds
-#define MIN_ALT_INCREASE 50.0
-#define APOGEE_VELOCITY_THRESHOLD -2.0
+#define MIN_ALT_INCREASE 25.0
+#define APOGEE_VELOCITY_THRESHOLD -1.0
 #define CONSECUTIVE_SAMPLES 5
+#define CALIBRATION_SAMPLES 50
+#define PYRO_DURATION_MS 600
 
 // Queue sizes
-#define MEASUREMENT_QUEUE_SIZE 100
+#define MEASUREMENT_QUEUE_SIZE 400
 #define EVENT_QUEUE_SIZE 100
-
-#define CALIBRATION_SAMPLES 50
-#define PYRO_DURATION_MS 500
 
 // Pin configuration
 #define PYRO_PIN 32
 #define LED_PIN 2
 #define BUZZER_PIN 27
-
 #define I2C_SCL_PIN 16
 #define I2C_SDA_PIN 17
-
 #define SPI_MISO_PIN 19
 #define SPI_MOSI_PIN 22
 #define SPI_CLK_PIN 21
 #define SPI_CS_PIN 23
 
+// SD card configuration
+#define MOUNT_POINT "/sdcard"
+#define SPI_HOST_ID SPI2_HOST
+static FILE *event_log_file = NULL;
+static FILE *data_log_file = NULL;
+
+// Standard sea level pressure
 #define SEA_LEVEL_PRESSURE 1013.25
+
+// Logging tag
+static const char *TAG = "FIRECRACKER";
 
 typedef enum {
     IDLE,
@@ -56,6 +67,7 @@ typedef enum {
     APOGEE_DETECTED,
     PYRO_ON,
     PYRO_OFF,
+    MEAS_FAILED,
 } event_type_t;
 
 typedef struct {
@@ -88,6 +100,86 @@ void i2c_init(i2c_master_bus_handle_t *i2c_bus_handle) {
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_config, i2c_bus_handle));
 }
 
+void sd_card_init(void) {
+    esp_err_t ret;
+
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = true,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024};
+
+    ESP_LOGI(TAG, "Initializing SPI bus...");
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = SPI_MOSI_PIN,
+        .miso_io_num = SPI_MISO_PIN,
+        .sclk_io_num = SPI_CLK_PIN,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+
+    ret = spi_bus_initialize(SPI_HOST_ID, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize bus.");
+        return;
+    }
+
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = SPI_HOST_ID;
+
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = SPI_CS_PIN;
+    slot_config.host_id = host.slot;
+
+    sdmmc_card_t *card;
+    ESP_LOGI(TAG, "Mounting filesystem");
+    ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_config,
+                                  &mount_config, &card);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to mount filesystem.");
+        return;
+    }
+    ESP_LOGI(TAG, "Filesystem mounted");
+
+    char data_file_path[64];
+    char event_file_path[64];
+    struct stat st;
+    int file_index = 0;
+
+    while (1) {
+        sprintf(data_file_path, "%s/data_%d.csv", MOUNT_POINT, file_index);
+        sprintf(event_file_path, "%s/events_%d.csv", MOUNT_POINT, file_index);
+
+        if (stat(data_file_path, &st) == 0 || stat(event_file_path, &st) == 0) {
+            ESP_LOGI(TAG, "Files exist, trying next index...");
+            file_index++;
+        } else {
+            break;
+        }
+    }
+
+    ESP_LOGI(TAG, "Writing to data file: %s", data_file_path);
+    ESP_LOGI(TAG, "Writing to event file: %s", event_file_path);
+
+    data_log_file = fopen(data_file_path, "w");
+    if (data_log_file == NULL) {
+        ESP_LOGE(TAG, "Failed to open data file for writing");
+        return;
+    }
+    fprintf(data_log_file, "timestamp_us,temperature_C,pressure_hPa\n");
+    fflush(data_log_file);
+
+    event_log_file = fopen(event_file_path, "w");
+    if (event_log_file == NULL) {
+        ESP_LOGE(TAG, "Failed to open event file for writing");
+        fclose(data_log_file);
+        return;
+    }
+    fprintf(event_log_file, "timestamp_us,event_type,altitude_m,velocity_ms\n");
+    fflush(event_log_file);
+}
+
 void gpio_output_init(void) {
     uint64_t pin_mask =
         (1ULL << PYRO_PIN) | (1ULL << LED_PIN) | (1ULL << BUZZER_PIN);
@@ -108,12 +200,24 @@ void gpio_output_init(void) {
 void data_logger_task(void *pvParameter) {
     measurement_t measurement;
     while (1) {
+        int measurement_counter = 0;
         if (xQueueReceive(measurement_queue, &measurement, portMAX_DELAY) ==
             pdTRUE) {
-            printf("%lld us | Temperature: %.2f C, Pressure: %.2f hPa\n",
-                   measurement.timestamp,
-                   (float)measurement.bmp.temperature / 100.0,
-                   (float)measurement.bmp.pressure / 25600.0);
+            ESP_LOGI(TAG, "%lld us | Temperature: %.2f C, Pressure: %.2f hPa\n",
+                     measurement.timestamp,
+                     (float)measurement.bmp.temperature / 100.0,
+                     (float)measurement.bmp.pressure / 25600.0);
+            if (data_log_file != NULL) {
+                fprintf(data_log_file, "%lld,%.2f,%.2f\n",
+                        measurement.timestamp,
+                        (float)measurement.bmp.temperature / 100.0,
+                        (float)measurement.bmp.pressure / 25600.0);
+                measurement_counter++;
+                if (measurement_counter >= 20) {
+                    fflush(data_log_file);
+                    measurement_counter = 0;
+                }
+            }
         }
     }
 }
@@ -122,9 +226,15 @@ void event_logger_task(void *pvParameter) {
     event_t event;
     while (1) {
         if (xQueueReceive(event_queue, &event, portMAX_DELAY) == pdTRUE) {
-            printf(
+            ESP_LOGI(
+                TAG,
                 "%lld us | Event: %d, Altitude: %.2f m, Velocity: %.2f m/s\n",
                 event.timestamp, event.event, event.altitude, event.velocity);
+            if (event_log_file != NULL) {
+                fprintf(event_log_file, "%lld,%d,%.2f,%.2f\n", event.timestamp,
+                        event.event, event.altitude, event.velocity);
+                fflush(event_log_file);
+            }
         }
     }
 }
@@ -137,6 +247,8 @@ void app_main(void) {
 
     bmp280_handle_t dev_bmp280;
     bmp280_init(i2c_bus_handle, &dev_bmp280, 0x76);
+
+    sd_card_init();
 
     int64_t pyro_fired_time;
 
@@ -182,7 +294,19 @@ void app_main(void) {
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000 / LOOP_FREQ_HZ));
 
         measurement.timestamp = esp_timer_get_time();
-        bmp280_read(&dev_bmp280, &measurement.bmp);
+
+        esp_err_t ret = bmp280_read(&dev_bmp280, &measurement.bmp);
+
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Sensor read failed");
+            event.timestamp = esp_timer_get_time();
+            event.event = MEAS_FAILED;
+            event.altitude = filtered_altitude;
+            event.velocity = filtered_velocity;
+            xQueueSend(event_queue, &event, 0);
+            continue;
+        }
+
         xQueueSend(measurement_queue, &measurement, 0);
 
         float press_hPa = measurement.bmp.pressure / 25600.0;

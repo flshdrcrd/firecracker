@@ -13,9 +13,6 @@
 #include <sys/stat.h>
 #include <sys/unistd.h>
 
-// Loop frequency
-#define LOOP_FREQ_HZ 20
-
 // Filter settings
 #define ALPHA_ALT 0.3
 #define ALPHA_VEL 0.3
@@ -23,15 +20,16 @@
 // Thresholds
 #define MIN_ALT_INCREASE 15.0
 #define APOGEE_VELOCITY_THRESHOLD -1.0
-#define CONSECUTIVE_SAMPLES 5
+#define APOGEE_SAMPLES 5
 #define CALIBRATION_SAMPLES 50
 #define PYRO_DURATION_MS 600
+#define LANDING_VELOCITY_THRESHOLD 0.5
+#define LANDING_SAMPLES 100
 
-// Queue sizes
-#define MEASUREMENT_QUEUE_SIZE 400
+#define LOOP_FREQ_HZ 20
+#define DATA_QUEUE_SIZE 400
 #define EVENT_QUEUE_SIZE 100
 
-// Pin configuration
 #define PYRO_PIN 32
 #define LED_PIN 2
 #define BUZZER_PIN 27
@@ -42,22 +40,19 @@
 #define SPI_CLK_PIN 21
 #define SPI_CS_PIN 23
 
-// SD card configuration
 #define MOUNT_POINT "/sdcard"
 #define SPI_HOST_ID SPI2_HOST
 static FILE *event_log_file = NULL;
 static FILE *data_log_file = NULL;
 
-// Standard sea level pressure
 #define SEA_LEVEL_PRESSURE 1013.25
-
-// Logging tag
 static const char *TAG = "FIRECRACKER";
 
 typedef enum {
     IDLE,
     ASCENT,
     DESCENT,
+    LANDED,
 } flight_state_t;
 
 typedef enum {
@@ -67,13 +62,14 @@ typedef enum {
     APOGEE_DETECTED,
     PYRO_ON,
     PYRO_OFF,
+    LANDING_DETECTED,
     MEAS_FAILED,
 } event_type_t;
 
 typedef struct {
     int64_t timestamp;
     bmp280_data_t bmp;
-} measurement_t;
+} data_t;
 
 typedef struct {
     int64_t timestamp;
@@ -82,7 +78,7 @@ typedef struct {
     float velocity;
 } event_t;
 
-QueueHandle_t measurement_queue;
+QueueHandle_t data_queue;
 QueueHandle_t event_queue;
 
 float calculate_altitude(float pressure_hPa) {
@@ -94,8 +90,8 @@ void i2c_init(i2c_master_bus_handle_t *i2c_bus_handle) {
                                               .scl_io_num = I2C_SCL_PIN,
                                               .sda_io_num = I2C_SDA_PIN,
                                               .glitch_ignore_cnt = 7,
-                                              .flags.enable_internal_pullup =
-                                                  true};
+                                              .flags.enable_internal_pullup = true,
+    };
 
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_config, i2c_bus_handle));
 }
@@ -106,9 +102,11 @@ void sd_card_init(void) {
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = true,
         .max_files = 5,
-        .allocation_unit_size = 16 * 1024};
+        .allocation_unit_size = 16 * 1024,
+    };
 
     ESP_LOGI(TAG, "Initializing SPI bus...");
+
     spi_bus_config_t bus_cfg = {
         .mosi_io_num = SPI_MOSI_PIN,
         .miso_io_num = SPI_MISO_PIN,
@@ -119,6 +117,7 @@ void sd_card_init(void) {
     };
 
     ret = spi_bus_initialize(SPI_HOST_ID, &bus_cfg, SPI_DMA_CH_AUTO);
+
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize bus.");
         return;
@@ -133,8 +132,7 @@ void sd_card_init(void) {
 
     sdmmc_card_t *card;
     ESP_LOGI(TAG, "Mounting filesystem");
-    ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_config,
-                                  &mount_config, &card);
+    ret = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot_config, &mount_config, &card);
 
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to mount filesystem.");
@@ -189,7 +187,8 @@ void gpio_output_init(void) {
                              .mode = GPIO_MODE_OUTPUT,
                              .pull_up_en = GPIO_PULLUP_DISABLE,
                              .pull_down_en = GPIO_PULLDOWN_DISABLE,
-                             .intr_type = GPIO_INTR_DISABLE};
+                             .intr_type = GPIO_INTR_DISABLE
+    };
 
     gpio_config(&io_conf);
 
@@ -199,25 +198,21 @@ void gpio_output_init(void) {
 }
 
 void data_logger_task(void *pvParameter) {
-    measurement_t measurement;
-    int measurement_counter = 0;
+    data_t data;
+    int data_counter = 0;
     while (1) {
-        if (xQueueReceive(measurement_queue, &measurement, portMAX_DELAY) ==
+        if (xQueueReceive(data_queue, &data, portMAX_DELAY) ==
             pdTRUE) {
-            ESP_LOGI(TAG, "%lld us | Temperature: %.2f C, Pressure: %.2f hPa\n",
-                     measurement.timestamp,
-                     (float)measurement.bmp.temperature / 100.0,
-                     (float)measurement.bmp.pressure / 25600.0);
+            ESP_LOGI(TAG, "%lld us | Temperature: %.2f C, Pressure: %.2f hPa",
+                     data.timestamp, (float)data.bmp.temperature / 100.0, (float)data.bmp.pressure / 25600.0);
             if (data_log_file != NULL) {
                 fprintf(data_log_file, "%lld,%.2f,%.2f\n",
-                        measurement.timestamp,
-                        (float)measurement.bmp.temperature / 100.0,
-                        (float)measurement.bmp.pressure / 25600.0);
-                measurement_counter++;
-                if (measurement_counter >= 20) {
+                        data.timestamp, (float)data.bmp.temperature / 100.0, (float)data.bmp.pressure / 25600.0);
+                data_counter++;
+                if (data_counter >= 20) {
                     fflush(data_log_file);
                     fsync(fileno(data_log_file));
-                    measurement_counter = 0;
+                    data_counter = 0;
                 }
             }
         }
@@ -228,9 +223,7 @@ void event_logger_task(void *pvParameter) {
     event_t event;
     while (1) {
         if (xQueueReceive(event_queue, &event, portMAX_DELAY) == pdTRUE) {
-            ESP_LOGI(
-                TAG,
-                "%lld us | Event: %d, Altitude: %.2f m, Velocity: %.2f m/s",
+            ESP_LOGI(TAG, "%lld us | Event: %d, Altitude: %.2f m, Velocity: %.2f m/s",
                 event.timestamp, event.event, event.altitude, event.velocity);
             if (event_log_file != NULL) {
                 fprintf(event_log_file, "%lld,%d,%.2f,%.2f\n", event.timestamp,
@@ -257,11 +250,11 @@ void app_main(void) {
 
     flight_state_t current_state = IDLE;
     int descent_check_counter = 0;
+    int landing_check_counter = 0;
 
-    measurement_queue =
-        xQueueCreate(MEASUREMENT_QUEUE_SIZE, sizeof(measurement_t));
+    data_queue = xQueueCreate(DATA_QUEUE_SIZE, sizeof(data_t));
     xTaskCreate(data_logger_task, "data_logger", 4096, NULL, 5, NULL);
-    measurement_t measurement;
+    data_t data;
 
     event_queue = xQueueCreate(EVENT_QUEUE_SIZE, sizeof(event_t));
     xTaskCreate(event_logger_task, "event_logger", 4096, NULL, 5, NULL);
@@ -275,8 +268,8 @@ void app_main(void) {
 
     float sum_alt = 0;
     for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
-        bmp280_read(&dev_bmp280, &measurement.bmp);
-        float press_hPa = measurement.bmp.pressure / 25600.0;
+        bmp280_read(&dev_bmp280, &data.bmp);
+        float press_hPa = data.bmp.pressure / 25600.0;
         sum_alt += calculate_altitude(press_hPa);
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -296,9 +289,9 @@ void app_main(void) {
     while (1) {
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000 / LOOP_FREQ_HZ));
 
-        measurement.timestamp = esp_timer_get_time();
+        data.timestamp = esp_timer_get_time();
 
-        esp_err_t ret = bmp280_read(&dev_bmp280, &measurement.bmp);
+        esp_err_t ret = bmp280_read(&dev_bmp280, &data.bmp);
 
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Sensor read failed");
@@ -310,19 +303,14 @@ void app_main(void) {
             continue;
         }
 
-        xQueueSend(measurement_queue, &measurement, 0);
+        xQueueSend(data_queue, &data, 0);
 
-        float press_hPa = measurement.bmp.pressure / 25600.0;
+        float press_hPa = data.bmp.pressure / 25600.0;
         float raw_altitude = calculate_altitude(press_hPa);
 
-        filtered_altitude = (ALPHA_ALT * raw_altitude) +
-                            ((1.0 - ALPHA_ALT) * filtered_altitude);
-
-        float instant_velocity =
-            (filtered_altitude - prev_filtered_altitude) / (1.0 / LOOP_FREQ_HZ);
-
-        filtered_velocity = (ALPHA_VEL * instant_velocity) +
-                            ((1.0 - ALPHA_VEL) * filtered_velocity);
+        filtered_altitude = (ALPHA_ALT * raw_altitude) + ((1.0 - ALPHA_ALT) * filtered_altitude);
+        float instant_velocity = (filtered_altitude - prev_filtered_altitude) / (1.0 / LOOP_FREQ_HZ);
+        filtered_velocity = (ALPHA_VEL * instant_velocity) + ((1.0 - ALPHA_VEL) * filtered_velocity);
 
         prev_filtered_altitude = filtered_altitude;
 
@@ -342,7 +330,7 @@ void app_main(void) {
             if (filtered_velocity < APOGEE_VELOCITY_THRESHOLD) {
                 descent_check_counter++;
 
-                if (descent_check_counter >= CONSECUTIVE_SAMPLES) {
+                if (descent_check_counter >= APOGEE_SAMPLES) {
                     current_state = DESCENT;
                     event.timestamp = esp_timer_get_time();
                     event.event = APOGEE_DETECTED;
@@ -366,8 +354,7 @@ void app_main(void) {
 
         case DESCENT:
             if (pyro_fired_time != 0) {
-                if (esp_timer_get_time() - pyro_fired_time >
-                    PYRO_DURATION_MS * 1000) {
+                if (esp_timer_get_time() - pyro_fired_time > PYRO_DURATION_MS * 1000) {
                     gpio_set_level(PYRO_PIN, 0);
                     pyro_fired_time = 0;
                     event.timestamp = esp_timer_get_time();
@@ -377,6 +364,24 @@ void app_main(void) {
                     xQueueSend(event_queue, &event, 0);
                 }
             }
+
+            if (fabs(filtered_velocity) < LANDING_VELOCITY_THRESHOLD) {
+                landing_check_counter++;
+                
+                if (landing_check_counter >= LANDING_SAMPLES) {
+                    current_state = LANDED;
+                    event.timestamp = esp_timer_get_time();
+                    event.event = LANDING_DETECTED;
+                    event.altitude = filtered_altitude;
+                    event.velocity = filtered_velocity;
+                    xQueueSend(event_queue, &event, 0);
+                }
+            } else {
+                landing_check_counter = 0;
+            }
+            break;
+            
+        case LANDED:
             break;
         }
     }

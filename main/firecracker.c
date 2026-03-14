@@ -21,7 +21,7 @@
 #define ALPHA_VEL 0.3
 
 // Thresholds
-#define MIN_ALT_INCREASE 25.0
+#define MIN_ALT_INCREASE 15.0
 #define APOGEE_VELOCITY_THRESHOLD -1.0
 #define CONSECUTIVE_SAMPLES 5
 #define CALIBRATION_SAMPLES 50
@@ -148,8 +148,8 @@ void sd_card_init(void) {
     int file_index = 0;
 
     while (1) {
-        sprintf(data_file_path, "%s/data_%d.csv", MOUNT_POINT, file_index);
-        sprintf(event_file_path, "%s/events_%d.csv", MOUNT_POINT, file_index);
+        sprintf(data_file_path, "%s/d_%d.csv", MOUNT_POINT, file_index);
+        sprintf(event_file_path, "%s/e_%d.csv", MOUNT_POINT, file_index);
 
         if (stat(data_file_path, &st) == 0 || stat(event_file_path, &st) == 0) {
             ESP_LOGI(TAG, "Files exist, trying next index...");
@@ -174,6 +174,7 @@ void sd_card_init(void) {
     if (event_log_file == NULL) {
         ESP_LOGE(TAG, "Failed to open event file for writing");
         fclose(data_log_file);
+        data_log_file = NULL;
         return;
     }
     fprintf(event_log_file, "timestamp_us,event_type,altitude_m,velocity_ms\n");
@@ -199,8 +200,8 @@ void gpio_output_init(void) {
 
 void data_logger_task(void *pvParameter) {
     measurement_t measurement;
+    int measurement_counter = 0;
     while (1) {
-        int measurement_counter = 0;
         if (xQueueReceive(measurement_queue, &measurement, portMAX_DELAY) ==
             pdTRUE) {
             ESP_LOGI(TAG, "%lld us | Temperature: %.2f C, Pressure: %.2f hPa\n",
@@ -215,6 +216,7 @@ void data_logger_task(void *pvParameter) {
                 measurement_counter++;
                 if (measurement_counter >= 20) {
                     fflush(data_log_file);
+                    fsync(fileno(data_log_file));
                     measurement_counter = 0;
                 }
             }
@@ -228,12 +230,13 @@ void event_logger_task(void *pvParameter) {
         if (xQueueReceive(event_queue, &event, portMAX_DELAY) == pdTRUE) {
             ESP_LOGI(
                 TAG,
-                "%lld us | Event: %d, Altitude: %.2f m, Velocity: %.2f m/s\n",
+                "%lld us | Event: %d, Altitude: %.2f m, Velocity: %.2f m/s",
                 event.timestamp, event.event, event.altitude, event.velocity);
             if (event_log_file != NULL) {
                 fprintf(event_log_file, "%lld,%d,%.2f,%.2f\n", event.timestamp,
                         event.event, event.altitude, event.velocity);
                 fflush(event_log_file);
+                fsync(fileno(event_log_file));
             }
         }
     }
@@ -257,11 +260,11 @@ void app_main(void) {
 
     measurement_queue =
         xQueueCreate(MEASUREMENT_QUEUE_SIZE, sizeof(measurement_t));
-    xTaskCreate(data_logger_task, "data_logger", 2048, NULL, 5, NULL);
+    xTaskCreate(data_logger_task, "data_logger", 4096, NULL, 5, NULL);
     measurement_t measurement;
 
     event_queue = xQueueCreate(EVENT_QUEUE_SIZE, sizeof(event_t));
-    xTaskCreate(event_logger_task, "event_logger", 2048, NULL, 5, NULL);
+    xTaskCreate(event_logger_task, "event_logger", 4096, NULL, 5, NULL);
     event_t event;
 
     event.timestamp = esp_timer_get_time();

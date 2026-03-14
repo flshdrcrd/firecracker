@@ -318,8 +318,7 @@ void app_main(void) {
         buzzer_mode = BUZZER_IDLE_ERROR;
     }
 
-    int64_t pyro_fired_time;
-
+    int64_t pyro_fired_time = 0;
     int descent_check_counter = 0;
     int landing_check_counter = 0;
     
@@ -454,6 +453,8 @@ void app_main(void) {
                     event.altitude = filtered_altitude;
                     event.velocity = filtered_velocity;
                     xQueueSend(event_queue, &event, 0);
+
+                    vTaskDelay(pdMS_TO_TICKS(10000));
 
                     if (data_log_file != NULL) {
                         fclose(data_log_file);

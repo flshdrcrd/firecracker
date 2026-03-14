@@ -13,18 +13,21 @@
 #include <sys/stat.h>
 #include <sys/unistd.h>
 
+#define MUTE_BUZZER
+
 // Filter settings
 #define ALPHA_ALT 0.3
 #define ALPHA_VEL 0.3
 
 // Thresholds
-#define MIN_ALT_INCREASE 15.0
+#define MIN_ALT_INCREASE 25
 #define APOGEE_VELOCITY_THRESHOLD -1.0
 #define APOGEE_SAMPLES 5
 #define CALIBRATION_SAMPLES 50
 #define PYRO_DURATION_MS 600
 #define LANDING_VELOCITY_THRESHOLD 0.5
 #define LANDING_SAMPLES 100
+#define IDLE_DELAY_MS 120000
 
 #define LOOP_FREQ_HZ 20
 #define DATA_QUEUE_SIZE 400
@@ -40,6 +43,11 @@
 #define SPI_CLK_PIN 21
 #define SPI_CS_PIN 23
 
+#ifdef MUTE_BUZZER
+    #undef BUZZER_PIN
+    #define BUZZER_PIN 2
+#endif
+
 #define MOUNT_POINT "/sdcard"
 #define SPI_HOST_ID SPI2_HOST
 static FILE *event_log_file = NULL;
@@ -49,7 +57,7 @@ static FILE *data_log_file = NULL;
 static const char *TAG = "FIRECRACKER";
 
 typedef enum {
-    IDLE,
+    ARMED,
     ASCENT,
     DESCENT,
     LANDED,
@@ -65,6 +73,16 @@ typedef enum {
     LANDING_DETECTED,
     MEAS_FAILED,
 } event_type_t;
+
+typedef enum {
+    BUZZER_IDLE,
+    BUZZER_IDLE_ERROR,
+    BUZZER_ARMED,
+    BUZZER_FLIGHT,
+    BUZZER_LANDED
+} buzzer_mode_t;
+
+buzzer_mode_t buzzer_mode = BUZZER_IDLE;
 
 typedef struct {
     int64_t timestamp;
@@ -96,7 +114,7 @@ void i2c_init(i2c_master_bus_handle_t *i2c_bus_handle) {
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_config, i2c_bus_handle));
 }
 
-void sd_card_init(void) {
+esp_err_t sd_card_init(void) {
     esp_err_t ret;
 
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
@@ -120,7 +138,7 @@ void sd_card_init(void) {
 
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize bus.");
-        return;
+        return ret;
     }
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
@@ -136,7 +154,7 @@ void sd_card_init(void) {
 
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to mount filesystem.");
-        return;
+        return ret;
     }
     ESP_LOGI(TAG, "Filesystem mounted");
 
@@ -163,7 +181,7 @@ void sd_card_init(void) {
     data_log_file = fopen(data_file_path, "w");
     if (data_log_file == NULL) {
         ESP_LOGE(TAG, "Failed to open data file for writing");
-        return;
+        return ESP_FAIL;
     }
     fprintf(data_log_file, "timestamp_us,temperature_C,pressure_hPa\n");
     fflush(data_log_file);
@@ -171,12 +189,12 @@ void sd_card_init(void) {
     event_log_file = fopen(event_file_path, "w");
     if (event_log_file == NULL) {
         ESP_LOGE(TAG, "Failed to open event file for writing");
-        fclose(data_log_file);
-        data_log_file = NULL;
-        return;
+        return ESP_FAIL;
     }
     fprintf(event_log_file, "timestamp_us,event_type,altitude_m,velocity_ms\n");
     fflush(event_log_file);
+
+    return ESP_OK;
 }
 
 void gpio_output_init(void) {
@@ -235,6 +253,57 @@ void event_logger_task(void *pvParameter) {
     }
 }
 
+void buzzer_task(void *pvParameter) {
+    while (1) {
+        switch (buzzer_mode) {
+            case BUZZER_IDLE:
+                gpio_set_level(BUZZER_PIN, 1);
+                gpio_set_level(LED_PIN, 1);
+                vTaskDelay(pdMS_TO_TICKS(200));
+                gpio_set_level(BUZZER_PIN, 0);
+                gpio_set_level(LED_PIN, 0);
+                vTaskDelay(pdMS_TO_TICKS(1800));
+                break;
+
+            case BUZZER_IDLE_ERROR:
+                for (int i = 0; i < 3; i++) {
+                    gpio_set_level(BUZZER_PIN, 1);
+                    gpio_set_level(LED_PIN, 1);
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    gpio_set_level(BUZZER_PIN, 0);
+                    gpio_set_level(LED_PIN, 0);
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                vTaskDelay(pdMS_TO_TICKS(1400));
+                break;
+
+            case BUZZER_ARMED:
+                gpio_set_level(BUZZER_PIN, 1);
+                gpio_set_level(LED_PIN, 1);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                gpio_set_level(BUZZER_PIN, 0);
+                gpio_set_level(LED_PIN, 0);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                break;
+
+            case BUZZER_FLIGHT:
+                gpio_set_level(BUZZER_PIN, 1);
+                gpio_set_level(LED_PIN, 1);
+                vTaskDelay(pdMS_TO_TICKS(10000));
+                break;
+
+            case BUZZER_LANDED:
+                gpio_set_level(BUZZER_PIN, 1);
+                gpio_set_level(LED_PIN, 1);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                gpio_set_level(BUZZER_PIN, 0);
+                gpio_set_level(LED_PIN, 0);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                break;
+        }
+    }
+}
+
 void app_main(void) {
     gpio_output_init();
 
@@ -244,21 +313,29 @@ void app_main(void) {
     bmp280_handle_t dev_bmp280;
     bmp280_init(i2c_bus_handle, &dev_bmp280, 0x76);
 
-    sd_card_init();
+    esp_err_t err = sd_card_init();
+    if (err != ESP_OK) {
+        buzzer_mode = BUZZER_IDLE_ERROR;
+    }
 
     int64_t pyro_fired_time;
 
-    flight_state_t current_state = IDLE;
     int descent_check_counter = 0;
     int landing_check_counter = 0;
-
+    
     data_queue = xQueueCreate(DATA_QUEUE_SIZE, sizeof(data_t));
     xTaskCreate(data_logger_task, "data_logger", 4096, NULL, 5, NULL);
     data_t data;
-
+    
     event_queue = xQueueCreate(EVENT_QUEUE_SIZE, sizeof(event_t));
     xTaskCreate(event_logger_task, "event_logger", 4096, NULL, 5, NULL);
     event_t event;
+    
+    xTaskCreate(buzzer_task, "buzzer_task", 2048, NULL, 7, NULL);
+    
+    vTaskDelay(pdMS_TO_TICKS(IDLE_DELAY_MS));
+    flight_state_t current_state = ARMED;
+    buzzer_mode = BUZZER_ARMED;
 
     event.timestamp = esp_timer_get_time();
     event.event = CALIB_START;
@@ -315,9 +392,10 @@ void app_main(void) {
         prev_filtered_altitude = filtered_altitude;
 
         switch (current_state) {
-        case IDLE:
+        case ARMED:
             if (filtered_altitude > (ground_altitude + MIN_ALT_INCREASE)) {
                 current_state = ASCENT;
+                buzzer_mode = BUZZER_FLIGHT;
                 event.timestamp = esp_timer_get_time();
                 event.event = LAUNCH_DETECTED;
                 event.altitude = filtered_altitude;
@@ -370,11 +448,21 @@ void app_main(void) {
                 
                 if (landing_check_counter >= LANDING_SAMPLES) {
                     current_state = LANDED;
+                    buzzer_mode = BUZZER_LANDED;
                     event.timestamp = esp_timer_get_time();
                     event.event = LANDING_DETECTED;
                     event.altitude = filtered_altitude;
                     event.velocity = filtered_velocity;
                     xQueueSend(event_queue, &event, 0);
+
+                    if (data_log_file != NULL) {
+                        fclose(data_log_file);
+                        data_log_file = NULL;
+                    }
+                    if (event_log_file != NULL) {
+                        fclose(event_log_file);
+                        event_log_file = NULL;
+                    }
                 }
             } else {
                 landing_check_counter = 0;

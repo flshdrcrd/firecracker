@@ -311,9 +311,18 @@ void app_main(void) {
     i2c_init(&i2c_bus_handle);
 
     bmp280_handle_t dev_bmp280;
-    bmp280_init(i2c_bus_handle, &dev_bmp280, 0x76);
+    esp_err_t err = bmp280_init(i2c_bus_handle, &dev_bmp280, 0x76);
 
-    esp_err_t err = sd_card_init();
+    if (err != ESP_OK) {
+    ESP_LOGE(TAG, "BMP280 init failed: %s", esp_err_to_name(err));
+    buzzer_mode = BUZZER_IDLE_ERROR;
+
+        while (1) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+
+    err = sd_card_init();
     if (err != ESP_OK) {
         buzzer_mode = BUZZER_IDLE_ERROR;
     }

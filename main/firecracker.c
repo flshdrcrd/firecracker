@@ -13,21 +13,21 @@
 #include <sys/stat.h>
 #include <sys/unistd.h>
 
-#define MUTE_BUZZER
-
-// Filter settings
-#define ALPHA_ALT 0.3
-#define ALPHA_VEL 0.3
+//#define MUTE_BUZZER
 
 // Thresholds
-#define MIN_ALT_INCREASE 25
-#define APOGEE_VELOCITY_THRESHOLD -1.0
+#define MIN_ALT_INCREASE 50
+#define APOGEE_VELOCITY_THRESHOLD -0.5
 #define APOGEE_SAMPLES 5
 #define CALIBRATION_SAMPLES 50
 #define PYRO_DURATION_MS 600
 #define LANDING_VELOCITY_THRESHOLD 0.5
 #define LANDING_SAMPLES 100
-#define IDLE_DELAY_MS 120000
+#define IDLE_DELAY_MS 1000000
+
+// Filter settings
+#define ALPHA_ALT 0.3
+#define ALPHA_VEL 0.3
 
 #define LOOP_FREQ_HZ 20
 #define DATA_QUEUE_SIZE 400
